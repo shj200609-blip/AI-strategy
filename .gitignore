@@ -1,0 +1,47 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+
+# --- Test / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache
+
+# --- Editor / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Claude / agent local state ---
+.claude/
+
+# --- Project artifacts (training + logs) ---
+checkpoints/
+runs/
+logs/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+
+# --- fheroes2 vendored source (kept locally, not pushed) ---
+fheroes2/

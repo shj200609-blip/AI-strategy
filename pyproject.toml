@@ -1,0 +1,12 @@
+[project]
+name = "alphago-battle-ai"
+version = "0.1.0"
+description = "AlphaGo/AlphaZero-style deep learning for fheroes2 battle AI"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "torch>=2.0",
+]
+
+[project.scripts]
+train-alphago = "scripts.train_alphago:main"
