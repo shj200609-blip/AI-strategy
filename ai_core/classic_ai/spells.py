@@ -490,7 +490,7 @@ def _score_spell(self, battle: BattleState, hero, spell: Spell,
                              retreating=False)
     if spell.kind == AOE:
         return _score_aoe(self, spell, hero, friendly, enemies,
-                          retreating=False)
+                          retreating=False, battle=battle)
     # ── 2. Dispel
     if spell.kind == DISPEL:
         return _score_dispel(self, spell, hero, friendly, enemies,
@@ -509,7 +509,7 @@ def _score_spell(self, battle: BattleState, hero, spell: Spell,
         return _score_teleport(self, battle, spell, hero, unit, enemies)
     # ── 7. Earthquake
     if name == "Earthquake":
-        return _score_earthquake(self, spell, friendly)
+        return _score_earthquake(self, spell, friendly, battle=battle)
     # ── 8. Friendly-targeted
     if spell.side_friendly or spell.kind == CURE:
         return _score_effect_dispatch(self, spell, hero, friendly, enemies,
@@ -561,7 +561,7 @@ def _score_damage(self, spell: Spell, hero, friendly: list, enemies: list,
 
 
 def _score_aoe(self, spell: Spell, hero, friendly: list, enemies: list,
-               *, retreating: bool) -> Tuple[float, Optional[Unit],
+               *, retreating: bool, battle=None) -> Tuple[float, Optional[Unit],
                                               Optional[Tuple[int, int]],
                                               Optional[Tuple[int, int]]]:
     """``spellDamageValue`` AoE branch — pick best centre cell.
@@ -663,12 +663,15 @@ def _score_aoe(self, spell: Spell, hero, friendly: list, enemies: list,
         # whatever falls inside the radius; the engine approximates
         # to "all alive friendlies within 1 hex" for that.
         if is_chain:
-            affected = [enemy] + _neighbour_targets(enemy, enemies)
+            affected = [enemy] + _neighbour_targets(enemy, enemies,
+                                                    grid=getattr(battle, "grid", None))
         else:
-            affected = [enemy] + _neighbour_targets(enemy, friendly)
+            affected = [enemy] + _neighbour_targets(enemy, friendly,
+                                                    grid=getattr(battle, "grid", None))
             # Also include nearby enemies in the radius (Fireball /
             # Meteor Shower hit a small ring of hexes).
-            affected += _neighbour_targets(enemy, enemies)
+            affected += _neighbour_targets(enemy, enemies,
+                                           grid=getattr(battle, "grid", None))
         seen = set()
         affected = [u for u in affected
                     if id(u) not in seen and not seen.add(id(u))]
@@ -744,12 +747,39 @@ def _hit_points_for(unit: Unit) -> int:
     return int(getattr(unit, "_total_hp", 0) or 0)
 
 
-def _neighbour_targets(unit: Unit, pool: list) -> list:
-    grid = None
-    # caller-side helper: the engine's AoE spell resolutions use
-    # BattleState._aoe_cells; here we approximate to all alive units
-    # within range — but fheroes2 chain-lightning distances are 0/cell.
-    return [u for u in pool if u is not unit and getattr(u, "is_alive", True)]
+def _neighbour_targets(unit: Unit, pool: list,
+                      grid: Optional["object"] = None) -> list:
+    """Return alive units in *pool* whose head cell is adjacent to *unit*.
+
+    Mirrors the engine's per-cell AoE resolution: fheroes2 chain
+    lightning / fireball / meteor shower / cold ring all hit the
+    centre unit and the units whose *head* cell is one of the six
+    neighbours of the centre's head. The previous implementation
+    silently included the entire pool — that over-counted chain
+    lightning to ``total enemy strength`` regardless of placement and
+    inflated AoE scores when targets were spread across the board.
+
+    Args:
+        grid: optional ``HexGrid``. When supplied we filter by
+            ``grid.distance(head, centre_head) == 1``. When *None*
+            (e.g. headless test fixtures) we fall back to the legacy
+            inclusive behaviour so legacy tests keep passing.
+    """
+    out = []
+    seen = set()
+    centre_head = getattr(unit, "pos", None)
+    for u in pool:
+        if u is unit or not getattr(u, "is_alive", True):
+            continue
+        if id(u) in seen:
+            continue
+        if grid is not None and centre_head is not None:
+            head = getattr(u, "pos", None)
+            if head is None or grid.distance(head, centre_head) != 1:
+                continue
+        out.append(u)
+        seen.add(id(u))
+    return out
 
 
 def _damage_heuristic(unit: Unit, damage: int, *,
@@ -1223,7 +1253,8 @@ def _score_teleport(self, battle: BattleState, spell: Spell, hero,
     return (value, outcome.target, dest, None)
 
 
-def _score_earthquake(self, spell: Spell, friendly: list
+def _score_earthquake(self, spell: Spell, friendly: list,
+                      *, battle=None
                       ) -> Tuple[float, Optional[Unit], Optional[Tuple[int, int]],
                                  Optional[Tuple[int, int]]]:
     """``spellEarthquakeValue`` — siege breaker (ai_battle_spell.cpp:924-973).
@@ -1253,15 +1284,16 @@ def _score_earthquake(self, spell: Spell, friendly: list
 
     # The C++ loops over ``Battle::Arena::getEarthQuakeSpellTargets``
     # (the canonical list of all 6 wall+tower positions) and skips
-    # the cosmetic bridge towers. The engine doesn't have that enum
-    # yet — the castle proxy exposes ``walls`` (4 entries) and
-    # ``towers`` (variable length, may include bridge towers); we
-    # therefore ask the proxy for the *valid* targets via
-    # ``get_earthquake_targets()`` when available, falling back to
-    # summing over walls+towers minus any explicitly-marked bridge
-    # towers.
-    castle = getattr(self, "_castle_proxy", None)
+    # the cosmetic bridge towers. The engine doesn't materialise a
+    # ``_castle_proxy`` on the planner, so the live castle is the
+    # battle's ``castle`` attribute. We pass it explicitly through
+    # ``battle`` because the score dispatcher already has it on
+    # hand — using ``self._castle_proxy`` would always be ``None``
+    # (the legacy bug) and silently neuter Earthquake scoring.
+    castle = (getattr(battle, "castle", None)
+              if battle is not None else None)
     if castle is None:
+        # No castle in this battle — Earthquake has no legal targets.
         return (0.0, None, None, None)
 
     targets = getattr(castle, "get_earthquake_targets", None)
@@ -1571,7 +1603,6 @@ def _maybe_farewell_spell(self, battle: BattleState,
     for name in hero.spells:
         if name not in SPELLS:
             continue
-        sp = SPELLS[sp.name] if hasattr(sp, "name") else SPELLS[name]  # noqa
         sp = SPELLS[name]
         if not hero.can_cast(sp):
             continue

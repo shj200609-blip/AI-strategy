@@ -257,6 +257,55 @@ def test_petrify_reduces_direct_attack_damage_to_half():
         f"pre-Petrify {base_roll}")
 
 
+def test_petrify_reduces_high_damage_to_exact_half():
+    """Regression: Petrify damage-halving lookup uses the right effect name.
+
+    battle_troop.cpp:562 — ``if ( enemy.Modes( SP_STONE ) ) dmg /= 2;``.
+    The corresponding Python ``Effect`` is named ``"Petrification"`` (the
+    builtin-only Petrification spell), NOT ``"Petrify"``.
+
+    The existing low-damage Petrify test passes coincidentally when the
+    bug is present (base=1 → ``max(1, 1//2) == 1``).  Use a high-count
+    Crusader vs Champion stack so the halving is unambiguous.
+    """
+    from engine.unit import Unit
+    from config import units as _u
+    grid = HexGrid()
+    c_t = dict(_u.UNIT_TYPES["Crusader"]); c_t["count"] = 10
+    ch_t = dict(_u.UNIT_TYPES["Champion"]); ch_t["count"] = 10
+    c = Unit("Crusader", 0, 1, 1, **c_t)
+    h = Unit("Champion", 1, 8, 1, **ch_t)
+    bs = BattleState(grid=grid, units=[c, h],
+                     first_team=0, attacker_team=0,
+                     heroes={0: Hero(power=1, name="A"),
+                             1: Hero(power=1, name="B")})
+    random.seed(0)
+    base = bs.expected_damage(c, h, ranged=False)
+    h.add_effect(make_effect(SPELLS["Petrification"], power=1))
+    after = bs.expected_damage(c, h, ranged=False)
+    assert base > 10, (
+        f"test fixture too weak to expose Petrify halving bug (base={base})")
+    assert after == max(1, base // 2), (
+        f"Petrify must halve expected_damage (battle_troop.cpp:562). "
+        f"Got base={base}, after={after}, expected={max(1, base // 2)}. "
+        f"This regression indicates a wrong effect-name lookup in "
+        f"expected_damage / roll_damage.")
+    # Same on the rolled path.
+    rolled_before = bs.roll_damage(c, h, ranged=False)
+    h2 = Unit("Champion", 1, 8, 1, **ch_t)
+    bs2 = BattleState(grid=grid, units=[c, h2],
+                      first_team=0, attacker_team=0,
+                      heroes={0: Hero(power=1, name="A"),
+                              1: Hero(power=1, name="B")})
+    random.seed(0)
+    _ = bs2.roll_damage(c, h2, ranged=False)  # advance RNG identically
+    h2.add_effect(make_effect(SPELLS["Petrification"], power=1))
+    rolled_after = bs2.roll_damage(c, h2, ranged=False)
+    assert rolled_after * 2 >= rolled_before, (
+        f"rolled dmg after Petrify ({rolled_after}) should be <= half of "
+        f"pre-Petrify ({rolled_before})")
+
+
 def test_petrified_unit_cannot_retaliate():
     """Petrify sets IS_PARALYZE_MAGIC, fheroes2 battle_troop.cpp:757-759 —
     so petrified units are immovable AND cannot retaliate.
@@ -632,6 +681,91 @@ def test_turn_number_and_death_totals_track_cumulative_kills():
     assert bs.attacker_dead_total == 0
     assert bs.defender_dead_total > 0
     assert bs.turn_number == 1
+
+
+def test_record_kill_counts_per_casualty_not_only_full_death():
+    """Regression: ``_record_kill`` must bump per-casualty like C++.
+
+    fheroes2 battle_troop.cpp:653 — every ``_applyDamage`` bumps the
+    unit's ``_deadCount`` for each creature killed in that hit, and
+    ``Force::getTotalNumberOfDeadUnits`` aggregates those per-unit
+    counters.  A 50-stack archer shot that kills 3 creatures then 5
+    creatures must bump ``defender_dead_total`` by 3 then 5, not jump
+    straight from 0 to 8 on the final killing blow.
+    """
+    from engine.actions import AttackAction
+    from config import units as _u
+    grid = HexGrid()
+    # Two 30-strong champion stacks. Champion deals ~20 dmg/hit so each
+    # strike kills only ~1 creature (Champions have 40 hp), exposing
+    # the per-casualty bump that battle_troop.cpp:653 expects.  We
+    # lift the TR_MOVED gate (``a._acted = False``) between strikes so
+    # we can observe the cumulative attribution within a single round.
+    a_t = dict(_u.UNIT_TYPES["Champion"]); a_t["count"] = 30
+    c_t = dict(_u.UNIT_TYPES["Champion"]); c_t["count"] = 30
+    a = Unit("Champion", 0, 7, 1, **a_t)
+    c = Unit("Champion", 1, 8, 1, **c_t)
+    bs = BattleState(grid=grid, units=[a, c],
+                     first_team=0, attacker_team=0,
+                     heroes={0: Hero(power=1, name="A"),
+                             1: Hero(power=1, name="B")})
+    bs.execute(AttackAction(a, c, ranged=False))
+    first_kill = bs.defender_dead_total
+    assert 0 < first_kill < c.count, (
+        f"per-casualty attribution: first hit must kill < entire stack; "
+        f"got defender_dead_total={first_kill} of {c.count}")
+    a._acted = False
+    bs.execute(AttackAction(a, c, ranged=False))
+    second_kill = bs.defender_dead_total
+    assert second_kill > first_kill, (
+        f"second hit must accumulate on top of first; "
+        f"got first={first_kill}, second={second_kill}")
+
+
+def test_record_kill_attributes_hypnotized_deaths_to_original_team():
+    """Regression: deaths must count against the *original* army.
+
+    fheroes2 battle_troop.cpp:653 + Battle::Troop::GetColor — a
+    Hypnotized unit's ``_deadCount`` belongs to its original Force
+    (Unit.team), not the hypnotized allegiance (effective_team).  The
+    AI planner uses these totals to decide retreat / strength, so a
+    unit that flips team and then dies must NOT silently vanish from
+    its original side's casualty count.
+
+    Previously ``_record_kill`` checked a non-existent
+    ``unit.original_team`` attribute and silently fell through to
+    ``unit.team``, which is the same value here, BUT the ``hasattr``
+    branch also masked the broader "only-fire-on-full-death" bug.
+    With Hypnotize we explicitly verify the original-team attribution.
+    """
+    from engine.actions import AttackAction
+    from config import units as _u
+    grid = HexGrid()
+    # Tiny high-attack attacker vs a 50-strong hypnotized enemy.
+    c_t = dict(_u.UNIT_TYPES["Champion"])
+    p_t = dict(_u.UNIT_TYPES["Peasant"]); p_t["count"] = 50
+    champ = Unit("Champion", 0, 7, 1, **c_t)
+    peasant = Unit("Peasant", 1, 8, 1, **p_t)
+    bs = BattleState(grid=grid, units=[champ, peasant],
+                     first_team=0, attacker_team=0,
+                     heroes={0: Hero(power=1, name="A"),
+                             1: Hero(power=1, name="B")})
+    # Hypnotize the peasant onto the attacker's side.
+    peasant.add_effect(make_effect(SPELLS["Hypnotize"], power=10))
+    assert peasant.team == 1 and peasant.effective_team == 0, (
+        "precondition: unit must be team=1 (defender) but effectively team=0 "
+        "(hypnotized to attacker's side)")
+    bs.execute(AttackAction(champ, peasant, ranged=False))
+    # The hypnotized defender should still count casualties against
+    # its ORIGINAL team (= 1 = defender).
+    assert bs.defender_dead_total > 0, (
+        f"hypnotized deaths must attribute to original team (defender). "
+        f"Got defender_dead_total={bs.defender_dead_total}, "
+        f"attacker_dead_total={bs.attacker_dead_total}")
+    assert bs.attacker_dead_total == 0, (
+        f"defender (now effectively ally) must NOT bleed attacker_dead_total. "
+        f"Got defender_dead_total={bs.defender_dead_total}, "
+        f"attacker_dead_total={bs.attacker_dead_total}")
 
 
 def test_clone_isolates_unit_mutations():

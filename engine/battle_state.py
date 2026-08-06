@@ -589,8 +589,10 @@ class BattleState:
             atk_bonus=self._hero_attack(atk.team),
             dfn_bonus=self._hero_defense(dfn.team))))
         # Petrified enemy takes half damage from a direct attack
-        # (battle_troop.cpp:562).
-        if dfn.has_effect("Petrify"):
+        # (battle_troop.cpp:562).  Effect's name is "Petrification" —
+        # the builtin-only Petrification spell, distinct from the
+        # SP_STONE bit.  The previous "Petrify" lookup silently no-op'd.
+        if dfn.has_effect("Petrification"):
             dmg = max(1, dmg // 2)
         # Archery skill: ranged damage +X% (battle_troop.cpp:526).
         if ranged:
@@ -639,8 +641,10 @@ class BattleState:
             mult *= 0.5
         dmg = max(1, int(base * mult))
         # Petrified enemy takes half damage from a direct attack
-        # (battle_troop.cpp:562).
-        if dfn.has_effect("Petrify"):
+        # (battle_troop.cpp:562).  Effect's name is "Petrification" —
+        # the builtin-only Petrification spell, distinct from the
+        # SP_STONE bit.  The previous "Petrify" lookup silently no-op'd.
+        if dfn.has_effect("Petrification"):
             dmg = max(1, dmg // 2)
         # Shield effect: reduce incoming ranged damage.
         if ranged:
@@ -693,13 +697,22 @@ class BattleState:
         fheroes2 tracks per-army casualties across the whole battle
         (``_attackerForceTotalNumberOfDeadUnits`` /
         ``_defenderForceTotalNumberOfDeadUnits``); the AI planner reads
-        them between turns.  Only bump on the killing side; friendly
-        fire (e.g. Berserker hitting own team) counts toward the
-        original team.
+        them between turns.  The Force-level total aggregates the
+        per-unit ``_deadCount`` of every unit *in that Force*,
+        regardless of allegiance flips — a Hypnotized stack that dies
+        still counts against its original army.
+
+        ``Unit.team`` is the army color set in ``__init__`` and is
+        never mutated by Hypnotize / Berserker (those only invert the
+        *effective* team via the ``effective_team`` property).  So
+        ``unit.team`` is the right side to attribute the death to —
+        and the ``unit.original_team`` attribute this method used to
+        probe never existed in the codebase, so the fallback was
+        always taken.
         """
         if killed <= 0:
             return
-        side = unit.original_team if hasattr(unit, "original_team") else unit.team
+        side = unit.team
         if side == self.attacker_team:
             self._attacker_dead_total = getattr(self, "_attacker_dead_total", 0) + killed
         else:
@@ -806,6 +819,12 @@ class BattleState:
                     desc += f" (dir={action.dir})"
                 if killed > 0:
                     desc += f" ({killed} killed)"
+                if killed > 0:
+                    # fheroes2 battle_troop.cpp:653 — every casualty
+                    # bumps the unit's _deadCount, which Force
+                    # aggregates per-army.  Match that: record
+                    # per-casualty, not only at full stack death.
+                    self._record_kill(tgt, killed)
 
             # ── primary target death / break effects ────────────────
             r['target_alive'] = tgt.is_alive
@@ -1261,6 +1280,10 @@ class BattleState:
         desc = f"{hero.name} casts {spell.name} on {tgt.name}: {actual} dmg"
         if killed > 0:
             desc += f" ({killed} killed)"
+            # fheroes2 battle_troop.cpp:653 — every casualty bumps the
+            # unit's _deadCount; match per-casualty attribution so the
+            # per-army totals reflect spell damage accurately.
+            self._record_kill(tgt, killed)
         if not tgt.is_alive:
             self.deaths_this_round += 1
             desc += " [DEAD]"
@@ -1281,6 +1304,9 @@ class BattleState:
         actual, killed = unit.take_damage(dmg)
         r['dmg'] += actual
         r['killed'] += killed
+        if killed > 0:
+            # fheroes2 battle_troop.cpp:653 — per-casualty bookkeeping.
+            self._record_kill(unit, killed)
         if not unit.is_alive:
             self.deaths_this_round += 1
         return actual, killed
