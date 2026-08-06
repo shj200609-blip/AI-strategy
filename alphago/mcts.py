@@ -126,10 +126,18 @@ def fast_clone_battle(battle: BattleState) -> BattleState:
     # Shallow copy the battle state
     import copy
     c = copy.copy(battle)
-    # Deep-copy only the things MCTS mutations touch
+    # Deep-copy only the things MCTS mutations touch.
+    # NOTE: ``u.effects`` holds ``Effect`` dataclass instances whose
+    # ``remaining`` counter is decremented in-place by ``Unit.tick_effects``
+    # (called from ``BattleState.start_round`` during MCTS rollouts).
+    # A plain ``copy.copy(u)`` + ``list(u.effects)`` rebuild would alias the
+    # Effect objects with the original battle, causing every clone's
+    # ``start_round`` to mutate the root state's effects and eventually
+    # expire buffs/debuffs that were never actually consumed. Clone each
+    # Effect as well so MCTS mutations stay confined to the simulation.
     c.units = [copy.copy(u) for u in battle.units]
     for u in c.units:
-        u.effects = list(u.effects)  # effects list is mutated
+        u.effects = [copy.copy(e) for e in u.effects]
     c.heroes = {t: copy.copy(h) if h else None for t, h in battle.heroes.items()}
     c._stale_rounds = battle._stale_rounds
     c.deaths_this_round = battle.deaths_this_round

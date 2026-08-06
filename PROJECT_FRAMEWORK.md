@@ -121,7 +121,7 @@ alphago-battle-ai/
 |---|---|---|
 | `base.py` | `AIPlayer` 抽象与每场战斗生命周期 | `battle_begins`, `check_retreat`, `maybe_cast_spell`, `decide` |
 | `battle_geometry.py` | 规则 AI 与动作编码共享的 wide-unit 几何 | `_tail_dir`, `_attack_cells`, `_can_attack_from_pos` |
-| `action_space.py` | 离散动作空间 13,566 维 + 合法掩码 | `action_to_index`, `index_to_action`, `legal_mask`, `enumerate_legal`, `ACTION_DIM` |
+| `action_space.py` | 离散动作空间 14,655 维 + 合法掩码 | `action_to_index`, `index_to_action`, `legal_mask`, `enumerate_legal`, `ACTION_DIM` |
 | `observation.py` | 玩家相对编码:35 通道网格 + 20 维全局向量 | `encode_observation(battle, unit) → (grid, gvec)` |
 | `model.py` | CNN+ResNet+Embedding 双头网络(`BattleNet`) | `BattleNet.forward(grid, gvec, mask) → (logits, value)` |
 | `classic_ai/` | 按分析/射手/近战/移动/撤退/法术拆分的 fheroes2 `BattlePlanner` 基线 AI | `ClassicAI` |
@@ -137,7 +137,7 @@ decide(battle, unit) -> (Action, str)
 
 `battle_begins()` 默认是 no-op；有每场状态的 AI（例如 `ClassicAI`）覆盖它。所有新建 `BattleState` 并驱动 AI 的 runner 必须在第一次决策前调用一次。
 
-**`BattleNet` 架构**(约 4.15M 参数):
+**`BattleNet` 架构**(约 13.5M 参数):
 
 ```
 grid (35,9,11)                         global (20,)
@@ -151,10 +151,10 @@ ResBlock × 6  (128→128)                     |
 concat → flatten → +global → Linear(15860,384)
      |
    ┌─┴──┐
-policy(13566)                         value(1) + tanh
+policy(14655)                         value(1) + tanh
 ```
 
-**动作空间布局**(共 13,566):
+**动作空间布局**(共 14,655):
 
 | 区间 | 含义 | 大小 |
 |---|---|---|
@@ -162,8 +162,8 @@ policy(13566)                         value(1) + tanh
 | 1 | Defend | 1 |
 | 2..100 | Move(col,row) | 99 |
 | 101..9901 | Attack(pos, target) = pos × 99 + target | 99² |
-| 9902..13564 | Cast(spell, hex) = spell × 99 + hex | 37 × 99 |
-| 13565 | Retreat | 1 |
+| 9902..14653 | Cast(spell, hex) = spell × 99 + hex | 48 × 99 |
+| 14654 | Retreat | 1 |
 
 **观测网格通道**(35, 9, 11):
 
@@ -177,6 +177,23 @@ policy(13566)                         value(1) + tanh
 | 32 | 活跃箭塔 |
 | 33 | 我方单位类型索引(归一化) |
 | 34 | 敌方单位类型索引(归一化) |
+
+**当前 `engine.spells.SPELLS` 词表**(48 条,按字母序排列,不含 Teleport):
+
+```
+Animate Dead, Anti-Magic, Armageddon, Berserker, Bless, Blind, Blood Lust,
+Chain Lightning, Cold Ray, Cold Ring, Cure, Curse, Death Ripple, Death Wave,
+Dispel Magic, Disrupting Ray, Dragon Slayer, Earthquake, Elemental Storm,
+Fireball, Fireblast, Haste, Holy Shout, Holy Word, Hypnotize, Lightning Bolt,
+Magic Arrow, Mass Bless, Mass Cure, Mass Curse, Mass Dispel, Mass Haste,
+Mass Shield, Mass Slow, Meteor Shower, Mirror Image, Paralyze, Petrification,
+Resurrect, Resurrect True, Shield, Slow, Steelskin, Stoneskin,
+Summon Air Elemental, Summon Earth Elemental, Summon Fire Elemental,
+Summon Water Elemental
+```
+
+新增/删除法术时同步更新 `ai_core/action_space._SPELL_ORDER` 与 `engine/spells.py`,
+并校验 `ACTION_DIM = 1 + 1 + 99 + 99² + 99·|SPELLS| + 1`。
 
 **全局向量**(20 维):round、attacker、双方存活数、双方 HP 比、双方法力/攻击/防御、是否 siege、活跃塔数、完整墙数、士气、幸运、当前回合顺序索引。
 
@@ -469,7 +486,7 @@ checkpoints/
 
 | 现象 | 排查 |
 |---|---|
-| `Action space mismatch` | 同步 `action_space.ACTION_DIM` 与 `BattleNet` 输出维度(均默认 13,566) |
+| `Action space mismatch` | 同步 `action_space.ACTION_DIM` 与 `BattleNet` 输出维度(均默认 14,655) |
 | `legal_mask` 全 0 | `BattleState._initial_counts` 未设置;或 `current_unit` 已死亡 |
 | 训练 loss 不下降 | 调低 `learning_rate`、`num_simulations` 是否过小、`batch_size` 是否过大 |
 | `Promote` 永远失败 | `win_rate_threshold=0.55` 太苛刻;或 `eval_games` 太少导致噪声大 |
@@ -495,7 +512,7 @@ checkpoints/
 - scripts/...: <改动点>
 
 ### 接缝影响
-- 动作空间:`ACTION_DIM` 从 13566 → 13568 (新增 XxxAction)
+- 动作空间:`ACTION_DIM` 从 14655 → 14657 (新增 XxxAction)
 - 观测通道:`NUM_GRID_CHANNELS` 从 35 → 36 (新增 Xxx 通道)
 - AIPlayer 接口:无 / 新增方法 X / 签名变更
 - 新超参:`AlphaGoConfig.xxx`,CLI `--xxx`

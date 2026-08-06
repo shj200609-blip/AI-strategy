@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 import torch
 
 from ai_core.base import AIPlayer
+from ai_core.classic_ai.constants import RETREAT_NONE
 from ai_core.model import BattleNet
 from engine.actions import Action, RetreatAction, CastAction
 from engine.battle_state import BattleState
@@ -24,7 +25,7 @@ class MCTSAIPlayer(AIPlayer):
     with ClassicAI or DeepAI in headless battles and GUI mode.
 
     All decisions (retreat, spellcast, unit action) go through the unified
-    MCTS search over the 13,566-dim action space.
+    MCTS search over the 14,655-dim action space.
 
     Parameters
     ----------
@@ -43,26 +44,47 @@ class MCTSAIPlayer(AIPlayer):
         model_path: Optional[str] = None,
         config: Optional[AlphaGoConfig] = None,
         device: str = "cpu",
+        model: Optional[BattleNet] = None,
     ):
         self.config = config or AlphaGoConfig()
         self.device = device
 
-        self.model = BattleNet()
-        if model_path is not None:
+        # ``model`` takes precedence over ``model_path``; if neither is
+        # supplied, a randomly-initialised network is created (testing only).
+        if model is not None:
+            self.model = model.to(device).eval()
+        elif model_path is not None:
+            self.model = BattleNet()
             ckpt = torch.load(model_path, map_location=device, weights_only=False)
             self.model.load_state_dict(ckpt["model"])
-        self.model.to(device).eval()
+            self.model.to(device).eval()
+        else:
+            self.model = BattleNet().to(device).eval()
 
         self.mcts = MCTS(self.config)
 
     # ── AIPlayer interface ───────────────────────────────────────────
 
-    def check_retreat(self, battle: BattleState, unit: Unit) -> None:
-        """MCTSAI handles retreat via the unified action space."""
-        return None
+    def check_retreat(self, battle: BattleState, unit: Unit
+                      ) -> Tuple[int, Optional[Tuple[Optional[Tuple[CastAction, str]],
+                                                       RetreatAction]]]:
+        """MCTSAI handles retreat via the unified action space.
 
-    def maybe_cast_spell(self, battle: BattleState, unit: Unit) -> None:
-        """MCTSAI handles spells via the unified action space."""
+        Always returns ``(RETREAT_NONE, None)`` — the MCTS search over
+        the unified 14,655-dim action space already encodes any retreat
+        intent, so a separate pre-action check is redundant. Returning a
+        well-formed tuple keeps the AIPlayer contract intact for callers
+        that walk the full per-activation protocol.
+        """
+        return (RETREAT_NONE, None)
+
+    def maybe_cast_spell(self, battle: BattleState, unit: Unit
+                         ) -> Optional[Tuple[CastAction, str]]:
+        """MCTSAI handles spells via the unified action space.
+
+        Always returns ``None`` — spell casting is one of the action
+        classes discoverable by MCTS, so no pre-action query is needed.
+        """
         return None
 
     def decide(self, battle: BattleState, unit: Unit) -> Tuple[Action, str]:
@@ -95,10 +117,10 @@ class MCTSAIPlayer(AIPlayer):
         """Create a player from an already-loaded model (no disk read).
 
         Useful in the pipeline for pit evaluation where the model is
-        already in memory.
+        already in memory.  Avoids the cost of constructing a random
+        ``BattleNet`` only to overwrite it.
         """
         player = cls.__new__(cls)
-        cls.__init__(player, model_path=None, config=config, device=device)
-        player.model = model.to(device)
-        player.model.eval()
+        cls.__init__(player, model_path=None, config=config, device=device,
+                     model=model)
         return player

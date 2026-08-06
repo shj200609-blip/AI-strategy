@@ -3,13 +3,13 @@
 Encodes every possible battle action into a single integer index and provides
 a binary mask indicating which actions are legal in the current state.
 
-Action layout (13 566 total):
+Action layout (14 655 total):
   Index 0              → Wait
   Index 1              → Defend
   Indices 2–100        → Move(hex[0..98])
   Indices 101–9901     → Attack(pos, target)  = pos × 99 + target
-  Indices 9902–13564   → Cast(spell[0..36], hex[0..98])
-  Index 13565          → Retreat
+  Indices 9902–14653   → Cast(spell[0..47], hex[0..98])
+  Index 14654          → Retreat
 
 Hex indexing: row-major  = row × 11 + col  (0–98).
 
@@ -63,7 +63,7 @@ ATTACK_END   = ATTACK_START + GRID_CELLS ** 2 - 1      # 9901
 CAST_START   = ATTACK_END + 1                           # 9902
 CAST_END     = CAST_START + NUM_SPELLS * GRID_CELLS - 1 # 13564
 RETREAT_IDX  = CAST_END + 1                             # 13565
-ACTION_DIM   = RETREAT_IDX + 1                          # 13566
+ACTION_DIM   = RETREAT_IDX + 1                          # 14655
 
 
 from ai_core.battle_geometry import _can_attack_from_pos, _tail_dir

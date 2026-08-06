@@ -22,9 +22,9 @@ class TrainingExample:
     global_vec : np.ndarray
         Global feature vector (20,), float32.
     mask : np.ndarray
-        Legal action mask (13566,), float32 (1 = legal).
+        Legal action mask (ACTION_DIM,), float32 (1 = legal).
     policy : np.ndarray
-        MCTS improved policy π (13566,), float32.  Sparse — zeros for
+        MCTS improved policy π (ACTION_DIM,), float32.  Sparse — zeros for
         illegal / unvisited actions.
     outcome : float
         Final game outcome from the perspective of the acting team.
@@ -84,8 +84,8 @@ class ReplayBuffer:
             Tensors stacked on dim 0:
               - "grid":    (B, 35, 9, 11)
               - "global":  (B, 20)
-              - "mask":    (B, 13566)
-              - "policy":  (B, 13566)
+              - "mask":    (B, ACTION_DIM)
+              - "policy":  (B, ACTION_DIM)
               - "outcome": (B, 1)
 
         Raises

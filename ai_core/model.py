@@ -4,7 +4,7 @@ AlphaGo Zero style: f_θ(s) → (p, v)
   - p: policy vector over actions (logits, masked for illegal actions)
   - v: scalar value in [-1, 1]
 
-Stripped of MoE complexity. ~4.15M parameters.
+Stripped of MoE complexity. ~13.5M parameters.
 Compatible with battle-ai-demo's encode_observation / action_space.
 
 Architecture:
@@ -36,7 +36,7 @@ Architecture:
     |                   |
   policy_head       value_head
   Linear(384,       Linear(384, 1)
-   13566)              + tanh
+   14655)              + tanh
     |
   logits (masked)
 """
@@ -96,7 +96,7 @@ class BattleNet(nn.Module):
     """CNN residual backbone with unit-type embedding and dual heads.
 
     Produces (policy_logits, value) as required by AlphaGo Zero MCTS.
-    No MoE — shared policy/value heads for simplicity (~4.15M params).
+    No MoE — shared policy/value heads for simplicity (~13.5M params).
     """
 
     def __init__(
@@ -147,10 +147,10 @@ class BattleNet(nn.Module):
         Args:
             grid:       (B, 35, 9, 11) grid feature map
             global_vec: (B, 20) global scalar vector
-            mask:       (B, 13566) legality mask (1 = legal, 0 = illegal)
+            mask:       (B, ACTION_DIM) legality mask (1 = legal, 0 = illegal)
 
         Returns:
-            policy_logits: (B, 13566) — masked logits (illegal = -inf)
+            policy_logits: (B, ACTION_DIM) — masked logits (illegal = -inf)
             value:         (B, 1) — value estimate in [-1, 1]
         """
         # 1. CNN backbone — original feature channels only (0–32)
@@ -176,7 +176,7 @@ class BattleNet(nn.Module):
         x = self.dropout(x)                               # 防过拟合(dropout.train()时生效)
 
         # 6. Dual heads
-        policy_logits = self.policy_head(x)              # (B, 13566)
+        policy_logits = self.policy_head(x)              # (B, ACTION_DIM)
         value = torch.tanh(self.value_head(x))           # (B, 1)
 
         # Mask illegal actions

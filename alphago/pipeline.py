@@ -78,7 +78,10 @@ class AlphaGoPipeline:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
         # Stats + early stopping
-        self._iteration = 0
+        # ``_iteration`` = index of the LAST COMPLETED iteration (-1 = none).
+        # Resuming reads this value and continues from ``_iteration + 1``;
+        # a fresh run starts from 0.
+        self._iteration = -1
         self._total_games = 0
         self._best_win_rate = 0.0
         self._stale_iters = 0
@@ -116,7 +119,18 @@ class AlphaGoPipeline:
         print(f"Checkpoints: {self.config.checkpoint_dir}/", flush=True)
         print()
 
-        for iteration in range(self.config.num_iterations):
+        # ── Resume: start from the saved iteration if we loaded one ──
+        # ``_iteration`` stores the index of the LAST completed iteration
+        # (0 means none completed yet).  When a checkpoint is loaded, the
+        # caller sets ``_iteration`` to that value; running from 0 would
+        # cause checkpoint-file collisions (iter_0010.pt gets overwritten).
+        start_iter = max(0, self._iteration + 1)
+        if start_iter > 0:
+            print(f"Resuming from iteration {start_iter + 1}/"
+                  f"{self.config.num_iterations}", flush=True)
+            print()
+
+        for iteration in range(start_iter, self.config.num_iterations):
             self._iteration = iteration
             t_iter_start = time.time()
             print(f"{'='*60}", flush=True)
@@ -443,8 +457,8 @@ class AlphaGoPipeline:
         eval_config = AlphaGoConfig(
             num_simulations=self.config.eval_mcts_simulations,
             c_puct=self.config.c_puct,
-            dirichlet_alpha=self.config.dirichlet_alpha,
-            dirichlet_epsilon=self.config.dirichlet_epsilon,
+            dirichlet_alpha=0.0,
+            dirichlet_epsilon=0.0,
             device=self.config.device,
             max_moves_per_game=self.config.max_moves_per_game,
             battle_configs=self.config.battle_configs,
@@ -542,12 +556,13 @@ class AlphaGoPipeline:
             return 0.0
         n_half = n_games // 2
 
-        # Configure for evaluation (potentially fewer sims)
+        # Configure for evaluation (potentially fewer sims; no Dirichlet
+        # noise — evaluation must reflect the network's true strength).
         eval_config = AlphaGoConfig(
             num_simulations=self.config.eval_mcts_simulations,
             c_puct=self.config.c_puct,
-            dirichlet_alpha=self.config.dirichlet_alpha,
-            dirichlet_epsilon=self.config.dirichlet_epsilon,
+            dirichlet_alpha=0.0,
+            dirichlet_epsilon=0.0,
             device=self.config.device,
             max_moves_per_game=self.config.max_moves_per_game,
             battle_configs=self.config.battle_configs,
@@ -652,7 +667,11 @@ class AlphaGoPipeline:
         # Restore optimizer if present
         if "optimizer" in ckpt and ckpt["optimizer"]:
             self.trainer.optimizer.load_state_dict(ckpt["optimizer"])
-        self._iteration = ckpt.get("iteration", 0)
+        # ``_iteration`` records the last COMPLETED iteration.  Default
+        # ``-1`` (no completed iterations) so a fresh ``run()`` starts
+        # at iteration 0; a restored checkpoint skips the iterations
+        # already represented by the saved value.
+        self._iteration = ckpt.get("iteration", -1)
         self._total_games = ckpt.get("total_games", 0)
         # Refresh opponent pool from disk — without this, a resumed run
         # would only ever see one opponent (best_model) for the rest of

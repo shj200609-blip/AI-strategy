@@ -794,6 +794,53 @@ def test_is_position_reachable_and_move_distance():
     assert bs.calculate_move_distance(archer, (-1, -1)) == 0
 
 
+def test_fast_clone_battle_isolates_effect_tick():
+    """Regression for the MCTS effect-aliasing bug.
+
+    ``fast_clone_battle`` must deep-copy each ``Effect`` on every unit so
+    that ``Unit.tick_effects`` (called via ``BattleState.start_round``
+    during MCTS rollouts) does not mutate the root battle's effect
+    counters. Without the per-effect ``copy.copy`` the clones share the
+    same ``Effect`` objects and the root's buffs/debuffs expire after a
+    handful of simulations.
+    """
+    from alphago.mcts import fast_clone_battle
+    from engine.spells import make_effect
+
+    bs = _fresh_battle()
+    archer = _find_archer(bs, 0)
+    # Bless lasts ``hero.power`` rounds; pick a duration that's easy to
+    # observe after several ticks.
+    archer.add_effect(make_effect(SPELLS["Bless"], power=5))
+    before = [e.remaining for e in archer.effects if e.name == "Bless"]
+    assert before == [5], f"unexpected initial remaining: {before}"
+
+    # Simulate five MCTS-style rollouts: clone + start_round + tick.
+    for _ in range(5):
+        clone = fast_clone_battle(bs)
+        # Each clone must share the same starting effect count, but be
+        # fully independent — i.e. ticking the clone must not consume the
+        # original Bless budget.
+        clone_archer = next(u for u in clone.units
+                            if u.team == 0 and u.is_archer)
+        clone_archer.tick_effects()
+
+    after = [e.remaining for e in archer.effects if e.name == "Bless"]
+    assert after == [5], (
+        f"fast_clone_battle aliased Effect objects: root Bless ticked "
+        f"from {before[0]} to {after[0]} across 5 simulations")
+
+    # Also assert the clone's tick really did decrement its own copy
+    # (otherwise the test would be vacuous if tick_effects were a no-op).
+    single = fast_clone_battle(bs)
+    single_archer = next(u for u in single.units
+                         if u.team == 0 and u.is_archer)
+    single_archer.tick_effects()
+    clone_remain = [e.remaining for e in single_archer.effects
+                    if e.name == "Bless"]
+    assert clone_remain == [4]
+
+
 def test_unit_get_uid_is_stable():
     bs = _fresh_battle()
     u = _find_archer(bs, 0)
