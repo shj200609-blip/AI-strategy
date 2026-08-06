@@ -571,6 +571,41 @@ class Unit:
         """
         return id(self)
 
+    def get_max_moves(self) -> int:
+        """fheroes2 ``Battle::Unit::GetMaxMovePoints`` = current speed.
+
+        Speed is movement points in this engine.  Slow halves speed
+        (spell.cpp Slow.halvesSpeed == true) and Haste adds +2; we
+        recompute on the fly so callers don't have to track spells.
+        """
+        sp = self.base_speed
+        # Slow halves speed (round up so a Slowed Speed-1 unit can't
+        # freeze).
+        if self.has_effect("Slow"):
+            sp = (sp + 1) // 2
+        if self.has_effect("Haste"):
+            sp += 2
+        return max(1, sp)
+
+    def is_hand_fighting(self, other: "Unit", grid) -> bool:
+        """fheroes2 ``Battle::Unit::isHandFighting`` — adjacent melee range.
+
+        True if the body cells of *self* and *other* share an edge
+        (hex-neighbour).  Both head and tail (for wide units) count as
+        attack reach.  ``grid`` is the battle's HexGrid (Unit is grid-
+        agnostic so we don't bloat per-unit state).
+        """
+        if not self.is_alive or not other.is_alive:
+            return False
+        other_cells = other.occupied_cells()
+        for cell in self.occupied_cells():
+            if cell in other_cells:
+                return True
+            for nb in grid.neighbors(*cell):
+                if nb in other_cells:
+                    return True
+        return False
+
     @property
     def is_alive(self) -> bool:
         return self._is_alive

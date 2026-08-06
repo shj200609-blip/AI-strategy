@@ -260,6 +260,31 @@ class Hero:
         # ``LearnSkill``; we mirror the validation here.
         self.skills: Dict[str, int] = self._validate_skills(skills or {})
 
+    def copy(self) -> "Hero":
+        """Shallow clone for MCTS sandboxing.
+
+        Each attribute is a primitive (int/str/list/dict); effects-like
+        containers (``spells``, ``skills``, ``bag_artifacts``) are copied
+        by value so the clone's mutations don't leak back to the parent.
+        """
+        import copy as _copy
+        new = self.__class__.__new__(self.__class__)
+        for attr in (
+            "name", "attack", "defense", "power", "knowledge",
+            "type", "is_hero", "is_captain", "in_castle",
+            "has_valuable_artifacts",
+            "kingdom_hero_count", "kingdom_castle_count",
+            "defends_last_castle",
+            "gold", "surrender_cost", "no_shooting_penalty",
+            "max_spell_points", "spell_points",
+        ):
+            setattr(new, attr, getattr(self, attr))
+        new.spells = list(self.spells)
+        new.skills = dict(self.skills)
+        new.bag_artifacts = _copy.copy(self.bag_artifacts)
+        new.modes = _copy.copy(self.modes)
+        return new
+
     # ── spellbook ───────────────────────────────────────────────
 
     @property

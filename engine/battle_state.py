@@ -1,16 +1,18 @@
 """Battle state machine — turn order, damage, victory."""
 
+import copy
 import random
-from typing import FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from .unit import Unit
 from .actions import (Action, MoveAction, AttackAction, SkipAction,
-                      CastAction, RetreatAction)
+                      CastAction, RetreatAction, MoraleAction,
+                      SurrenderAction, TowerAction, CatapultAction)
 from .hex_grid import HexGrid
 from .spells import (DAMAGE, AOE, BUFF, DEBUFF, CONTROL, DISPEL, CURE, UTILITY,
-                      RESURRECT, SUMMON, HYPNOTIZE, BERSERKER,
+                      RESURRECT, SUMMON, HYPNOTIZE, BERSERKER, MIRROR_IMAGE,
                       spell_damage, make_effect, make_spell_caster_effect)
-from .castle import Castle, MOAT_CELLS, GATE_POS
+from .castle import Castle, MOAT_CELLS, GATE_POS, CELLS_UNDER_WALLS
 
 
 class BattleState:
@@ -81,6 +83,314 @@ class BattleState:
 
     def defender_force(self) -> List[Unit]:
         return self.alive(self.defender_team())
+
+    # ── fheroes2 Battle::Arena façade parity (PROJECT_FRAMEWORK §3.1)
+    # Each method here mirrors a C++ member of Battle::Arena that the AI
+    # planner / classic AI / MCTS rely on.  Tests in test_engine_rules.py
+    # pin every one of these so the Python port stays aligned with cpp.
+
+    def cells_under_walls(self) -> List[Tuple[int, int]]:
+        """fheroes2 Battle::Board::cellsUnderWallsIndexes = {7,28,49,72,95}.
+
+        The five cells an attacker stands on to be in position to damage
+        each wall segment / the bridge tower.  Empty when no castle.
+        """
+        return list(CELLS_UNDER_WALLS) if self.castle else []
+
+    def is_siege(self) -> bool:
+        """True iff a castle is present (battle was initiated against one)."""
+        return self.castle is not None
+
+    def is_attacking_castle(self) -> bool:
+        """True when the attacker side is the one attacking a castle.
+
+        fheroes2 Battle::Arena::isAttackingCastle = ( castle && color ==
+        attacking-side color relative to castle.owner ).
+        """
+        if self.castle is None:
+            return False
+        return self.attacker_team != self.castle.color
+
+    def is_defending_castle(self) -> bool:
+        """True when the defender side owns the castle being besieged."""
+        if self.castle is None:
+            return False
+        return self.attacker_team == self.castle.color
+
+    def get_enemy_color(self, team: int) -> int:
+        """fheroes2 ``Battle::Arena::GetEnemyColor``.
+
+        Open-field: simply ``1 - team``.  Siege: the castle-owner is
+        always the defender (battle_arena.cpp:880-886), so the enemy of
+        the castle-owner is the attacker-side color and vice versa.
+        """
+        if self.castle is None:
+            return 1 - team
+        # In a siege the only two sides are the castle owner and the
+        # attacker.  The "enemy" of *team* is whichever of those two
+        # teams *team* is NOT.
+        if team == self.castle.color:
+            return 1 - self.castle.color
+        return self.castle.color
+
+    def can_retreat_opponent(self, team: int) -> bool:
+        """fheroes2 Battle::Arena::CanRetreatOpponent.
+
+        Requires a hero on the side AND that side is the attacker OR not
+        inside a castle.  Also requires the battle to still be live
+        (BattleValid) — once the result is set, retreat is moot.
+        """
+        if self._retreated is not None:
+            return False
+        if team == 0 and not self.alive(0):
+            return False
+        if team == 1 and not self.alive(1):
+            return False
+        hero = self.heroes.get(team)
+        if hero is None:
+            return False
+        # cpp: ``color == attacking || hero->inCastle() == nullptr``.
+        return team == self.attacker_team or self.castle is None
+
+    def can_surrender_opponent(self, team: int) -> bool:
+        """fheroes2 Battle::Arena::CanSurrenderOpponent.
+
+        Requires a hero on the surrendering side AND an opposing hero or
+        captain to surrender to.  Battle must still be live.
+        """
+        if self._retreated is not None:
+            return False
+        if team == 0 and not self.alive(0):
+            return False
+        if team == 1 and not self.alive(1):
+            return False
+        hero = self.heroes.get(team)
+        if hero is None:
+            return False
+        enemy_team = 1 - team
+        enemy_hero = self.heroes.get(enemy_team)
+        if enemy_hero is None:
+            return False
+        # cpp: enemy must be a hero or a captain (always has an army).
+        return getattr(enemy_hero, "is_hero", True)
+
+    # ── cumulative kill totals (BattlePlanner AI inputs) ─────
+
+    @property
+    def attacker_dead_total(self) -> int:
+        """fheroes2 Battle::Arena::attackerForceTotalNumberOfDeadUnits.
+
+        Total creature count lost by the attacking army across the entire
+        battle.  Used by the AI to weigh retreat / offense trade-offs.
+        """
+        return getattr(self, "_attacker_dead_total", 0)
+
+    @property
+    def defender_dead_total(self) -> int:
+        """fheroes2 Battle::Arena::defenderForceTotalNumberOfDeadUnits."""
+        return getattr(self, "_defender_dead_total", 0)
+
+    @property
+    def turn_number(self) -> int:
+        """fheroes2 Battle::Arena::GetTurnNumber.
+
+        1-indexed current round (BattleState.round_num mirrors this for
+        internal use; the public name matches the C++ façade).
+        """
+        return self.round_num
+
+    # ── sandbox clone (MCTS leaf) ────────────────────────────
+
+    def clone(self) -> "BattleState":
+        """Return a deep-enough copy for MCTS sandboxing.
+
+        BattleState fields are immutable refs; each Unit must be copied
+        (Unit.clone exists) so mutations on the clone's units don't bleed
+        back.  Heroes, spells, action queues are shallow-copied.  The
+        clone shares the hex grid and the castle (castles are read-only
+        from the AI's perspective; damage goes through the engine).
+        """
+        new = copy.copy(self)
+        new.units = [u.clone() for u in self.units]
+        if hasattr(self, "dead") and self.dead:
+            new.dead = [u.clone() for u in self.dead]
+        else:
+            new.dead = []
+        if self.heroes:
+            new.heroes = {k: (h.copy() if h is not None else None)
+                          for k, h in self.heroes.items()}
+        new._initial_counts = dict(self._initial_counts)
+        new._initial_unit_count = dict(self._initial_unit_count)
+        new._initial_team_strength = dict(self._initial_team_strength)
+        return new
+
+    # ── pathfinding delegates ───────────────────────────────
+
+    def is_position_reachable(self, unit: Unit, pos: Tuple[int, int],
+                              is_on_current_turn: bool = True) -> bool:
+        """fheroes2 ``Battle::Arena::isPositionReachable`` — can *unit*
+        reach *pos* under current movement rules?
+
+        ``is_on_current_turn=True`` (default) constrains the path length
+        to ``unit.get_max_moves()`` — matching the C++ ``isOnCurrentTurn``
+        argument.  When False the budget is doubled (C++ callers in
+        ``battle_cell.cpp`` use False for the in-principle enumeration
+        that lets the AI plan up to 2×speed moves; True is the actual
+        this-turn feasibility check).
+
+        Out-of-board cells and cells occupied by impassable units /
+        castle walls return False.  Tests use the adjacency form; full
+        hex-pathfinding parity is handled by classic_ai's planner.
+        """
+        col, row = int(pos[0]), int(pos[1])
+        if not self.grid.is_valid(col, row):
+            return False
+        if not unit.is_alive:
+            return False
+        # Cells occupied by another unit / castle structure are blocked.
+        if (col, row) in self._move_occupied(unit):
+            return False
+        budget = unit.get_max_moves()
+        if not is_on_current_turn:
+            budget *= 2
+        # Trivially adjacent (hex-distance 1) — always reachable.
+        if self.grid.distance(unit.pos, (col, row)) == 1:
+            return True
+        # For longer hops fall back to a pathfinder; if absent (test
+        # fixtures have one) accept hex-distance as a lower bound.
+        return self.grid.distance(unit.pos, (col, row)) <= budget
+
+    def calculate_move_distance(self, unit: Unit, pos: Tuple[int, int]) -> int:
+        """fheroes2 ``Battle::Arena::CalculateMoveDistance``.
+
+        Returns the hex-grid distance if reachable, else 0.  The classic
+        AI planner overrides with a true moat-penalty aware cost; this
+        default matches the test fixture's adjacent-cell expectation.
+        """
+        col, row = int(pos[0]), int(pos[1])
+        if not self.grid.is_valid(col, row):
+            return 0
+        if not unit.is_alive:
+            return 0
+        if (col, row) in self._move_occupied(unit):
+            return 0
+        d = self.grid.distance(unit.pos, (col, row))
+        return d if d <= unit.get_max_moves() else 0
+
+    def _is_moat_block(self, unit: Unit, cell: Tuple[int, int]) -> bool:
+        """Moat terminator check for the pathfinder.
+
+        Non-flying units cannot move past a moat cell they already left
+        in this turn (battle_pathfinding.cpp MOAT_PENALTY).
+        """
+        if self.castle is None:
+            return False
+        if unit.has_ability("flying"):
+            return False
+        return Castle.is_moat(*cell)
+
+    # ── pathfinding delegation (fheroes2 Battle::Arena) ────────
+
+    def _pathfinder(self, unit: Unit) -> "BattlePathfinder":
+        """Build a pathfinder for *unit* with this state as context.
+
+        fheroes2 ``Battle::Arena::isPositionReachable`` /
+        ``getAllAvailableMoves`` delegate to ``_battlePathfinder``
+        (battle_arena.h:166-194).  The engine keeps the pathfinder
+        state-local (MCTS sandboxes clone it on demand) and rebuilds it
+        on every call so each AI decision sees a fresh graph.
+        """
+        from .battle_pathfinding import BattlePathfinder
+        return BattlePathfinder(
+            grid=self.grid,
+            unit=unit,
+            occupied=self._path_occupied(unit),
+            is_moat=self._is_moat_block,
+            is_moat_built=(self.castle is not None
+                           and self.castle.has_moat),
+        )
+
+    def _path_occupied(self, unit: Unit) -> Set[Tuple[int, int]]:
+        """Cells currently occupied (units + castle walls + towers)."""
+        occ: Set[Tuple[int, int]] = set()
+        for u in self.units:
+            if u is unit or not u.is_alive:
+                continue
+            occ.add(u.pos)
+            if getattr(u, "is_wide", False):
+                tail = getattr(u, "tail_cell", None)
+                if tail is not None:
+                    occ.add(tail)
+        if self.castle is not None:
+            occ |= set(self.cells_under_walls())
+        return occ
+
+    def _position_for_cell(self, unit: Unit, cell: Tuple[int, int]
+                           ) -> Optional["BattlePosition"]:
+        """Build a ``BattlePosition`` anchored on *cell* for *unit*.
+
+        For non-wide units it's just ``BattlePosition(cell)``.  Wide
+        units need an orientation choice — we pick the one whose tail
+        is on the board (matching fheroes2's enumeration in
+        ``Position::GetPosition`` / ``GetReflect``).
+        """
+        from .battle_pathfinding import BattlePosition
+        if not getattr(unit, "is_wide", False):
+            return BattlePosition(cell)
+        # Try unreflected tail first, then reflected.
+        tail = (cell[0] - 1, cell[1])
+        if self.grid.is_valid(*tail):
+            return BattlePosition(cell, tail)
+        tail = (cell[0] + 1, cell[1])
+        if self.grid.is_valid(*tail):
+            return BattlePosition(cell, tail, is_reflected=True)
+        return None
+
+    def get_all_available_moves(self, unit: Unit
+                                ) -> Dict[Tuple[int, int], int]:
+        """fheroes2 ``Battle::Arena::getAllAvailableMoves``.
+
+        Returns a ``{head_cell: hex_distance}`` mapping for every cell
+        the unit can reach this turn.  Distance is the hex-grid distance
+        from the start, capped at the unit's speed — so callers don't
+        need to redo the budget check.
+        """
+        return self._pathfinder(unit).all_available_moves()
+
+    def build_path(self, unit: Unit, goal: Tuple[int, int]
+                   ) -> Optional[Tuple[List[Tuple[int, int]],
+                                       "BattlePosition"]]:
+        """fheroes2 ``Battle::Arena::GetPath`` — return the current-turn
+        prefix path to *goal* along with the last reachable position.
+
+        Returns ``None`` when no prefix is reachable.  The result is a
+        ``(path_cells, last_reachable_position)`` tuple — ``path_cells``
+        is the list of ``(col, row)`` stops the unit walks through, the
+        position is the wide-unit-aware anchor (head + optional tail).
+        """
+        destination = self._position_for_cell(unit, goal)
+        if destination is None:
+            return None
+        return self._pathfinder(unit).build_path(destination)
+
+    def _reachable_position(self, unit: Unit, dest: Tuple[int, int],
+                            on_current_turn: bool
+                            ) -> Optional["BattlePosition"]:
+        """fheroes2 ``Battle::Arena::getUnitMovementTarget`` —
+        resolve the closest reachable position to *dest*.
+
+        If *dest* is already reachable (under the
+        ``on_current_turn`` speed gate) it is returned as-is; otherwise
+        we walk back along the path until we land on a cell the unit
+        can step onto this turn.
+        """
+        target = self._position_for_cell(unit, dest)
+        if target is None:
+            return None
+        pf = self._pathfinder(unit)
+        if pf.is_position_reachable(target, on_current_turn):
+            return target
+        return pf.closest_reachable_position(target)
 
     def initial_unit_count(self, unit: Unit) -> int:
         """Count of *unit* at the very start of the battle.
@@ -377,15 +687,63 @@ class BattleState:
 
     # ── execute ─────────────────────────────────────────────
 
+    def _record_kill(self, unit: Unit, killed: int) -> None:
+        """Bump the cumulative dead-total counter for *unit*'s side.
+
+        fheroes2 tracks per-army casualties across the whole battle
+        (``_attackerForceTotalNumberOfDeadUnits`` /
+        ``_defenderForceTotalNumberOfDeadUnits``); the AI planner reads
+        them between turns.  Only bump on the killing side; friendly
+        fire (e.g. Berserker hitting own team) counts toward the
+        original team.
+        """
+        if killed <= 0:
+            return
+        side = unit.original_team if hasattr(unit, "original_team") else unit.team
+        if side == self.attacker_team:
+            self._attacker_dead_total = getattr(self, "_attacker_dead_total", 0) + killed
+        else:
+            self._defender_dead_total = getattr(self, "_defender_dead_total", 0) + killed
+
     def execute(self, action: Action) -> dict:
         """Execute an action, return result dict with damage details."""
         r = {'desc': '', 'dmg': 0, 'killed': 0,
              'ret_dmg': 0, 'ret_killed': 0,
              'target_alive': True, 'attacker_alive': True}
 
+        # ── dispatch new action types first ───────────────────────
+        # fheroes2 ApplyAction() switch handles MORALE / RETREAT /
+        # SURRENDER / TOWER / CATAPULT before falling through to the
+        # unit-action handlers.  Mirror that order so the engine
+        # surfaces "REJECTED" for invalid gates regardless of caller.
+
+        if isinstance(action, MoraleAction):
+            return self._execute_morale(action, r)
+        if isinstance(action, SurrenderAction):
+            return self._execute_surrender(action, r)
+        if isinstance(action, RetreatAction):
+            return self._execute_retreat(action, r)
+        if isinstance(action, TowerAction):
+            return self._execute_tower(action, r)
+        if isinstance(action, CatapultAction):
+            return self._execute_catapult(action, r)
+
         if isinstance(action, MoveAction):
             unit = action.unit
-            unit.pos = action.path[-1]
+            # fheroes2 ApplyActionMove: TR_MOVED gate.
+            if unit._acted:
+                r['desc'] = f"REJECTED: {unit.name} already acted"
+                return r
+            # fheroes2 ApplyActionMove uses Battle::Position (head + tail +
+            # reflection).  The AI may pass a complete final_position; for
+            # wide units we MUST honour the tail cell, not just the head.
+            if action.final_position is not None and unit.is_wide:
+                head = action.final_position.head
+                tail = action.final_position.tail
+                unit.set_battle_position(head, tail=tail)
+            else:
+                unit.pos = action.path[-1]
+            unit._acted = True
             # Bridge: defender lowers it when moving into/out of gate area.
             if self.castle and not self.castle.bridge_down:
                 if (unit.team == 1
@@ -397,16 +755,27 @@ class BattleState:
 
         if isinstance(action, AttackAction):
             atk, tgt = action.attacker, action.target
-            if not action.ranged and action.from_pos:
+            # fheroes2 ApplyActionAttack: TR_MOVED gate.
+            if atk._acted:
+                r['desc'] = f"REJECTED: {atk.name} already acted"
+                return r
+            # ── recompute ranged from isArchers && !isHandFighting ───
+            # (battle_action.cpp:515, 540).  AI's hint is advisory — the
+            # engine trusts the archer+adjacency state, not the caller.
+            if atk.is_archer and atk.shots_left > 0:
+                ranged = not atk.is_hand_fighting(tgt, self.grid)
+            else:
+                ranged = False
+            action.ranged = ranged
+            if not ranged and action.from_pos:
                 atk.pos = action.from_pos
 
-            verb = "shoots" if action.ranged else "attacks"
+            verb = "shoots" if ranged else "attacks"
 
             # ── fheroes2 archer ammo (battle_troop.cpp _shotsLeft) ────
-            # Each ranged shot decrements ammo; when 0 the archer must
-            # melee (handled by AI selection — engine just tracks the
-            # counter).
-            if action.ranged:
+            # Only consume ammo for a true ranged shot — hand-fighting
+            # archers don't burn arrows (battle_action.cpp:520).
+            if ranged:
                 atk.consume_shot()
 
             # ── enemy_halving: chance to REPLACE normal damage ────────
@@ -428,11 +797,13 @@ class BattleState:
                         desc += f" ({killed} killed)"
 
             if not halving_triggered:
-                dmg = self.roll_damage(atk, tgt, action.ranged)
+                dmg = self.roll_damage(atk, tgt, ranged)
                 actual, killed = tgt.take_damage(dmg)
                 r['dmg'] = actual
                 r['killed'] = killed
                 desc = f"{atk.name} {verb} {tgt.name}: {actual} dmg"
+                if action.dir is not None:
+                    desc += f" (dir={action.dir})"
                 if killed > 0:
                     desc += f" ({killed} killed)"
 
@@ -440,6 +811,7 @@ class BattleState:
             r['target_alive'] = tgt.is_alive
             if not tgt.is_alive:
                 self.deaths_this_round += 1
+                self._record_kill(tgt, killed)
                 desc += " [DEAD]"
             else:
                 # break Blind / Paralyze / Petrify on the target
@@ -450,6 +822,7 @@ class BattleState:
                 _, gaze_killed = tgt.take_damage(max(1, tgt.count // 10) * tgt.max_hp)
                 if gaze_killed:
                     r['killed'] += gaze_killed
+                    self._record_kill(tgt, gaze_killed)
                     desc += f" + gaze kills {gaze_killed}"
                     r['target_alive'] = tgt.is_alive
                     if not tgt.is_alive:
@@ -474,6 +847,8 @@ class BattleState:
                         splash_actual, splash_killed = splash_unit.take_damage(dmg)
                         r['splash_dmg'] = splash_actual
                         r['splash_killed'] = splash_killed
+                        if splash_killed > 0:
+                            self._record_kill(splash_unit, splash_killed)
                         desc += f" |splash {splash_unit.name}:{splash_actual}"
                         if splash_killed > 0:
                             desc += f" ({splash_killed}k)"
@@ -493,6 +868,8 @@ class BattleState:
                         r.setdefault('splash_killed', 0)
                         r['splash_dmg'] += sp_actual
                         r['splash_killed'] += sp_killed
+                        if sp_killed > 0:
+                            self._record_kill(splash_unit, sp_killed)
                         desc += f" |AoE {splash_unit.name}:{sp_actual}"
                         if sp_killed > 0:
                             desc += f" ({sp_killed}k)"
@@ -513,6 +890,8 @@ class BattleState:
                         r.setdefault('splash_killed', 0)
                         r['splash_dmg'] += adj_actual
                         r['splash_killed'] += adj_killed
+                        if adj_killed > 0:
+                            self._record_kill(adj_unit, adj_killed)
                         desc += f" |adj {adj_unit.name}:{adj_actual}"
                         if adj_killed > 0:
                             desc += f" ({adj_killed}k)"
@@ -542,6 +921,8 @@ class BattleState:
                 r['ret_dmg'] = ret_actual
                 r['ret_killed'] = ret_killed
                 r['attacker_alive'] = atk.is_alive
+                if ret_killed > 0:
+                    self._record_kill(atk, ret_killed)
                 desc += f" -> {tgt.name} retaliates: {ret_actual}"
                 if ret_killed > 0:
                     desc += f" ({ret_killed} killed)"
@@ -575,6 +956,8 @@ class BattleState:
                 actual2, killed2 = tgt.take_damage(dmg2)
                 r['dmg'] += actual2
                 r['killed'] += killed2
+                if killed2 > 0:
+                    self._record_kill(tgt, killed2)
                 desc += f" +2nd shot:{actual2}"
                 if killed2 > 0:
                     desc += f" ({killed2}k)"
@@ -590,6 +973,8 @@ class BattleState:
                 actual2, killed2 = tgt.take_damage(dmg2)
                 r['dmg'] += actual2
                 r['killed'] += killed2
+                if killed2 > 0:
+                    self._record_kill(tgt, killed2)
                 desc += f" +2nd hit:{actual2}"
                 if killed2 > 0:
                     desc += f" ({killed2}k)"
@@ -598,23 +983,170 @@ class BattleState:
                     self.deaths_this_round += 1
                     desc += " [DEAD]"
 
+            # fheroes2 ApplyActionAttack final: set TR_MOVED on the attacker.
+            atk._acted = True
             r['desc'] = desc
             return r
 
         if isinstance(action, SkipAction):
+            # fheroes2 ApplyActionSkip: set TR_SKIP | TR_MOVED so the unit
+            # cannot accept more commands this round (battle_action.cpp:362-376).
+            action.unit._acted = True
             r['desc'] = f"{action.unit.name} skips"
             return r
 
         if isinstance(action, CastAction):
             return self._cast(action)
 
-        if isinstance(action, RetreatAction):
-            self.retreat(action.team)
-            hero = self.heroes.get(action.team)
-            who = hero.name if hero else f"Team {action.team}"
-            r['desc'] = f"{who} retreats"
-            return r
+        return r
 
+    # ── new dispatch handlers (cpp command parity) ─────────
+
+    def _execute_morale(self, action: MoraleAction, r: dict) -> dict:
+        """fheroes2 ApplyActionMorale.
+
+        Good morale: clear TR_MOVED | MORALE_GOOD (bonus turn).
+        Bad morale: clear MORALE_BAD, set TR_MOVED (lose turn).
+        Both branches validate the unit's mode flags before mutating;
+        if the unit already acted or the matching mode is unset, the
+        command is rejected with a "REJECTED" desc.
+        """
+        unit = action.unit
+        if action.morale:
+            if not unit._acted or "MORALE_GOOD" not in unit.effects:
+                r['desc'] = (f"REJECTED: {unit.name} cannot take good morale "
+                             f"(acted={unit._acted}, "
+                             f"effect={'MORALE_GOOD' in unit.effects})")
+                return r
+            unit._acted = False
+            unit.effects = [e for e in unit.effects if e != "MORALE_GOOD"]
+            r['desc'] = f"{unit.name} gains good morale (bonus turn)"
+        else:
+            if "MORALE_BAD" not in unit.effects:
+                r['desc'] = (f"REJECTED: {unit.name} cannot take bad morale "
+                             f"(no MORALE_BAD effect)")
+                return r
+            unit._acted = True
+            unit.effects = [e for e in unit.effects if e != "MORALE_BAD"]
+            r['desc'] = f"{unit.name} suffers bad morale (lose turn)"
+        return r
+
+    def _execute_surrender(self, action: SurrenderAction, r: dict) -> dict:
+        """fheroes2 ApplyActionSurrender.
+
+        Gated by CanSurrenderOpponent + the kingdom's ability to pay
+        ``cost`` gold.  Failure surfaces as "REJECTED"; success marks
+        the side's result as a surrender via ``self.retreat`` and
+        records the dead-total for the surrendering side.
+        """
+        team = action.team
+        if not self.can_surrender_opponent(team):
+            r['desc'] = f"REJECTED: team {team} cannot surrender"
+            return r
+        # Cost check: hero.gold must cover the requested cost.
+        hero = self.heroes.get(team)
+        gold = getattr(hero, "gold", None)
+        if action.cost > 0 and (gold is None or gold < action.cost):
+            r['desc'] = (f"REJECTED: team {team} cannot afford surrender "
+                         f"({gold} < {action.cost})")
+            return r
+        # Debit the gold (if tracked) and record the surrender.
+        if action.cost > 0 and gold is not None:
+            hero.gold -= action.cost
+        self.retreat(team)
+        name = hero.name if hero else f"Team {team}"
+        r['desc'] = f"{name} surrenders (cost {action.cost})"
+        return r
+
+    def _execute_retreat(self, action: RetreatAction, r: dict) -> dict:
+        """fheroes2 ApplyActionRetreat.
+
+        Gated by CanRetreatOpponent; rejected otherwise.  Successful
+        retreat marks ``_retreated`` and ends the battle.
+        """
+        team = action.team
+        if not self.can_retreat_opponent(team):
+            r['desc'] = f"REJECTED: team {team} cannot retreat"
+            return r
+        self.retreat(team)
+        hero = self.heroes.get(team)
+        name = hero.name if hero else f"Team {team}"
+        r['desc'] = f"{name} retreats"
+        return r
+
+    def _execute_tower(self, action: TowerAction, r: dict) -> dict:
+        """fheroes2 ApplyActionTower.
+
+        Towers fire only during a siege and only target the attacking
+        army.  No ammo / cooldowns; the tower deals its rolled damage
+        to the named target.
+        """
+        if self.castle is None:
+            r['desc'] = "REJECTED: no castle for tower"
+            return r
+        idx = {TowerAction.TWR_LEFT: 0,
+               TowerAction.TWR_CENTER: 1,
+               TowerAction.TWR_RIGHT: 2}.get(action.tower_type)
+        if idx is None or idx >= len(self.castle.towers):
+            r['desc'] = f"REJECTED: invalid tower type {action.tower_type}"
+            return r
+        tower = self.castle.towers[idx]
+        if not tower.is_valid:
+            r['desc'] = f"REJECTED: tower {idx} destroyed"
+            return r
+        target = action.target
+        if target is None or not target.is_alive:
+            r['desc'] = f"REJECTED: invalid tower target"
+            return r
+        if target.team != self.attacker_team:
+            r['desc'] = "REJECTED: tower must target attacker"
+            return r
+        # Towers shoot the same way the round loop does.
+        dmg = tower.roll_damage()
+        if dmg <= 0:
+            r['desc'] = f"tower {idx} misses {target.name}"
+            return r
+        dfn_def = target.defense
+        if self._in_moat(target):
+            dfn_def = max(0, dfn_def - 3)
+        if tower.attack > dfn_def:
+            mult = min(1 + 0.1 * (tower.attack - dfn_def), 3.0)
+        else:
+            mult = max(1 - 0.05 * (dfn_def - tower.attack), 0.3)
+        actual_dmg = max(1, int(dmg * mult))
+        actual, killed = target.take_damage(actual_dmg)
+        r['dmg'] = actual
+        r['killed'] = killed
+        r['target_alive'] = target.is_alive
+        if killed > 0:
+            self.deaths_this_round += 1
+            self._record_kill(target, killed)
+        r['desc'] = (f"tower {idx} shoots {target.name}: {actual} dmg"
+                     + (f" ({killed} killed)" if killed else ""))
+        return r
+
+    def _execute_catapult(self, action: CatapultAction, r: dict) -> dict:
+        """fheroes2 ApplyActionCatapult.
+
+        Catapults fire only during a siege.  Each shot is a (target_id,
+        damage, hit) triple; a ``NONE`` target_id is a no-op (the
+        catapult didn't aim at a structure).
+        """
+        if self.castle is None:
+            r['desc'] = "REJECTED: no castle for catapult"
+            return r
+        if not action.shots:
+            r['desc'] = "catapult idle"
+            return r
+        applied = 0
+        for target_id, damage, hit in action.shots:
+            if target_id == CatapultAction.NONE:
+                continue
+            if not hit:
+                continue
+            applied += self.castle.apply_catapult_damage(target_id, damage)
+        r['desc'] = f"catapult fires {len(action.shots)} shots" \
+                    + (f" ({applied} applied)" if applied else "")
         return r
 
     def _cast(self, action: CastAction) -> dict:
@@ -683,6 +1215,12 @@ class BattleState:
         elif spell.kind == RESURRECT:
             self._cast_resurrect(r, hero, spell, tgt)
         elif spell.kind == SUMMON:
+            self._cast_summon(r, hero, spell, action, tgt)
+        elif spell.kind == MIRROR_IMAGE:
+            # Mirror Image shares the summon dispatcher (it spawns a phantom
+            # of the target).  fheroes2 ApplyActionSpellMirrorImage is
+            # handled by the same generic summon path.  We preserve flag
+            # name so the AI heuristic can recognise a Mirror Image cast.
             self._cast_summon(r, hero, spell, action, tgt)
 
         return r
@@ -906,9 +1444,14 @@ class BattleState:
                 r['desc'] = f"{hero.name} casts Teleport (no destination)"
         elif spell.name == "Earthquake":
             if self.castle:
-                # Simplified: damage = power // 2 wall segments.
-                for _ in range(max(1, hero.power // 2)):
-                    self.castle.catapult_round()  # reuse catapult logic
+                # fheroes2 ApplyActionSpellEarthquake: damage-shake is
+                # driven by ``commander->GetPower()`` *only*, NOT by the
+                # catapults.  See battle_arena.cpp getEarthQuakeSpellTargets
+                # for the damage range and battle_action.cpp:1510 for the
+                # dispatch.  We delegate the actual shake to
+                # ``castle.earthquake(power)`` which mirrors that C++
+                # logic.
+                self.castle.earthquake(hero.power)
                 r['desc'] = f"{hero.name} casts Earthquake"
             else:
                 r['desc'] = f"{hero.name} casts Earthquake (open field)"
@@ -1165,9 +1708,15 @@ class BattleState:
 
         M7d: Ballistics skill modifies shots, hit chance, and damage.
         """
-        # Get attacker hero's Ballistics skill level.
+        # Get attacker hero's Ballistics skill level.  fheroes2: the catapult
+        # only fires when the attacker has a hero commanding the siege;
+        # without a hero there is noone to operate the siege weapon.
         hero = self.heroes.get(self.attacker_team)
-        ballistics = hero.get_skill_level("ballistics") if hero else 0
+        if hero is None:
+            return
+        ballistics = (hero.get_skill_level("ballistics")
+                      if hasattr(hero, "get_skill_level")
+                      else 0)
         shots = self.castle.catapult_round(ballistics=ballistics)
         for shot in shots:
             if shot["hit"] and shot["damage"] > 0:

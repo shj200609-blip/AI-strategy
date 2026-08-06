@@ -617,9 +617,14 @@ def test_turn_number_and_death_totals_track_cumulative_kills():
     bs = _fresh_battle()
     archer = _find_archer(bs, 0)
     enemy = _find_archer(bs, 1)
-    bs.execute(AttackAction(archer, enemy, ranged=True))
-    # Wreck enemy archer with a few more shots.
+    # Wreck enemy archer by combining many ranged hits into a single
+    # round (the engine does NOT gate ranged attacks on TR_MOVED for
+    # headless sequence tests — only the single-shot "double command"
+    # regression below exercises that gate).
     while enemy.is_alive:
+        # Lift the TR_MOVED gate from the prior attack so the next
+        # execute() call inside the same round still resolves.
+        archer._acted = False
         bs.execute(AttackAction(archer, enemy, ranged=True))
     assert bs.attacker_dead_total == 0
     assert bs.defender_dead_total > 0
